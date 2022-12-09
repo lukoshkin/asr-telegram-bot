@@ -1,6 +1,9 @@
 #!/bin/bash
 
-function help_msg () {
+set -e
+export DOCKER_BUILDKIT=1
+
+help_msg () {
   echo 'Usage: ./start.sh [<options>]'
   echo
   echo -e '  -h, --help\t\t Show this message.'
@@ -8,7 +11,7 @@ function help_msg () {
   echo
   printf "  -p\t\t\t Publish client's port to the host\n"
   printf '  -t,--tag\t\t Tag of the Triton server image.'
-  printf ' Default: 21.09-py3\n'
+  printf ' Default: 22.11-py3\n'
   printf '  -n, --names\t\t Names for server and client separated by comma.'
   printf ' Default: server,client\n\n'
   printf '  -m, --models\t\t Set classification and/or ASR NN model(s).'
@@ -18,13 +21,13 @@ function help_msg () {
 }
 
 
-function container_is_running () {
+container_is_running () {
   [[ $# -eq 0 ]] && { echo Impl.error1: pass an argument.; exit 1; }
   [[ -n $(docker ps -q -fname="$1") ]] && return 0 || return 1
 }
 
 
-function launch_and_check () {
+launch_and_check () {
   local name=$1
   local cmd_args=$2
   local stop_word=$3
@@ -36,7 +39,7 @@ function launch_and_check () {
   fi
 
   local run_cmd="docker run --rm -d --name $name --net=backend"
-  local logfile=/tmp/nn-powered-tg-bot.log
+  local logfile=/tmp/asr-telegram-bot.log
 
   printf "Starting %s.." "$name"
   if ! container_is_running "$name"; then
@@ -47,7 +50,7 @@ function launch_and_check () {
     # (docker logs -f "$name" 2>&1 | sed 'a
     # ' | sed "/$stop_word/ q") >> $logfile
 
-    sleep 1
+    sleep 2  # Unreliable: hard-coded and should be adjusted manually
     if container_is_running "$name"; then
       printf '\b\b [✓]\n'
       return 0
@@ -60,13 +63,13 @@ function launch_and_check () {
 }
 
 
-function main () {
-  short_opts=h,0,p:,t:,n:,m:,c:
+init_variables () {
+  local short_opts long_opts params names models
   long_opts=help,from-scratch,tag:,names:,models:,topk-guesses:
+  short_opts=h,0,p:,t:,n:,m:,c:
 
   params=$(getopt -o $short_opts -l $long_opts  --name "$0" -- "$@")
   eval set -- "$params"
-  unset params
 
   while [[ $1 != -- ]]; do
     case $1 in
@@ -84,11 +87,9 @@ function main () {
     esac
   done
 
-  server_img=nvcr.io/nvidia/tritonserver:${tag:-21.09-py3}
-  client_img=triton-client:dev
-
-  model_depo="$(realpath "$(dirname "$0")/models")"
-  workdir="$(realpath "$(dirname "$0")")"
+  workdir="$(realpath "$(dirname "${BASH_SOURCE[0]}")")"
+  server_img=triton-server:tg-bot
+  client_img=triton-client:tg-bot
 
   server=$(cut -d, -f1 <<< "$names")
   client=$(cut -d, -f2 <<< "$names")
@@ -97,38 +98,51 @@ function main () {
 
   visual_model=$(cut -d, -f1 <<< "$models")
   audio_model=$(cut -d, -f2 <<< "$models")
+}
 
-  if [[ ! -d $model_depo || -z $(ls -A "$model_depo") ]]; then
-    echo "You don't have any models."
-    echo "But you can fetch some with 'fetch_models.sh' script."
-    return
-  fi
+
+main () {
+  init_variables "$@"
 
   if ${from_scratch:=false}; then
-    docker stop "$server" 2> /dev/null
-    docker stop "$client" 2> /dev/null
+    docker stop "$server" 2> /dev/null || :  # discard return value; thus,
+    docker stop "$client" 2> /dev/null || :  # the cmd is ignored by `set -e`
   fi
 
   if $from_scratch || [[ -z $(docker images -q "$server_img") ]]; then
-    docker pull "$server_img"
+    docker build \
+      --build-arg "IMAGE_TAG=${tag:-22.11-py3}" \
+      -t "$server_img" server/
   fi
 
   if $from_scratch || [[ -z $(docker images -q "$client_img") ]]; then
-    docker build -t "$client_img" docker/
+    docker build \
+      --cache-from "$client_img" \
+      --cache-from "$server_img" \
+      -t "$client_img" client/
   fi
 
-  docker network create backend 2> /dev/null
-  launch_and_check "$server" \
-    "-v$model_depo:/models $server_img \
+  # Ignore the exit code of network creation if the network already exists.
+  docker network create backend 2> /dev/null || :
+
+  launch_and_check "$server" \ "$server_img \
     tritonserver --model-repository=/models" \
-    'Started GRPCInferenceService at' || return 1
+    'Started GRPCInferenceService at'
 
   launch_and_check "$client" \
     "-e ASR_MODEL=${audio_model:-quartznet15x5} \
      -e CLASSIFIER_MODEL=${visual_model:-inception_graphdef} \
      -e CLASSIFIER_TOPK=${topk:-1} \
      -p${port:-8000}:80 -v$workdir:/workspace $client_img" \
-     'Application startup complete' || return 1
+     'Application startup complete'
+
+  docker cp "$server":/models/quartznet15x5/1/processor.pt \
+    "$client":/workspace/
+
+  if [[ -d server/models ]]; then
+    echo Copying custom models..
+    docker cp models/custom/* "$server":/models
+  fi
 }
 
 

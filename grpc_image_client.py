@@ -305,7 +305,7 @@ def requestGenerator(input_name, output_name, c, h, w, format, dtype, FLAGS,
         yield request
 
 
-def main():
+def build_argparser():
     parser = argparse.ArgumentParser()
     parser.add_argument('-v',
                         '--verbose',
@@ -368,7 +368,12 @@ def main():
                         nargs='?',
                         default=None,
                         help='Input image / Input folder.')
-    FLAGS = parser.parse_args()
+    return parser
+
+
+def main(args=None):
+    parser = build_argparser()
+    FLAGS = parser.parse_args(args)
 
     # Create gRPC stub for communicating with the server
     channel = grpc.insecure_channel(FLAGS.url)

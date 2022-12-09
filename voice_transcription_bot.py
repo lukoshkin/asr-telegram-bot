@@ -40,7 +40,9 @@ async def send_welcome(message: types.Message):
             f"Hello, {message.from_user.first_name}!\n\n"
             "I'm TranscribeVoiceBot! In narrow circles, "
             "I'm also known as ImageClassifierBot, but never mind\n\n"
-            "Send me a voice (lang: eng) ─ I will transcibe it for you.")
+            "Send me a voice (lang: eng) ─ I will transcribe it for you.\n\n"
+            "If you're bored recording audios, try to send an image."
+            "But don't send nudes - I save them for blackmailing.")
 
 
 @dp.message_handler()

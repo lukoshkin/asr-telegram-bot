@@ -36,8 +36,8 @@ from torchaudio.transforms import MelSpectrogram, Resample
 from tritonclient.grpc import service_pb2, service_pb2_grpc
 from tritonclient.utils import triton_to_np_dtype
 
-from asr_utils import CTCGreedyDecoder
-GREEDY_DECODER = CTCGreedyDecoder(" abcdefghijklmnopqrstuvwxyz'")
+# from asr_utils import CTCGreedyDecoder
+# GREEDY_DECODER = CTCGreedyDecoder(" abcdefghijklmnopqrstuvwxyz'")
 
 
 def read_audiofile(
@@ -67,39 +67,19 @@ def read_audiofile(
     return signal, sample_rate
 
 
-def preemphasized(signal: torch.Tensor, alpha=.97) -> torch.Tensor:
-    """
-    Improves signal-to-noise ratio.
-    (Maybe redundant here since it is from older system designs.)
-    """
-    return torch.cat((signal[:1], signal[1:] - alpha * signal[:-1]))
-
-
-def normalize_spectra(spectra: torch.Tensor) -> torch.Tensor:
-    """
-    Mean-variance normalization.
-    Input can be spectra or just one spectrum.
-    """
-    mu = spectra.mean(-1, keepdims=True)
-    sigma = spectra.std(-1, keepdims=True)
-    spectra = (spectra - mu) / (sigma + 1e-5)
-
-    return spectra
-
-
 class AudioTranscriber:
     """
     Simple triton-client (gRPC protocol) for audio inference.
     """
     def __init__(
             self, url, model_name, model_version,
-            streaming, asynchronous, batch_size, transform):
+            processor, streaming, asynchronous, batch_size):
         self.batch_size = batch_size
         self.model_name = model_name
         self.model_version = model_version
+        self.processor = processor
         self.asynchronous = asynchronous
         self.streaming = streaming
-        self.transform = transform
 
         self._parse_model(url)
         self._request = self._request_template()
@@ -188,11 +168,11 @@ class AudioTranscriber:
 
         return request
 
-    def __call__(self, audio_file, frame_size):
+    def __call__(self, audio_file, max_length_size):
         """
         Transcribe audio file.
         """
-        batch_gen = self._compose_batches(audio_file, frame_size)
+        batch_gen = self._compose_batches(audio_file, max_length_size)
         transciption = []
 
         if self.streaming:
@@ -220,7 +200,7 @@ class AudioTranscriber:
 
         return self._stub.ModelInfer(self._request)
 
-    def _compose_batches(self, audio, frame_size):
+    def _compose_batches(self, audio, max_length_size):
         """
         Make batches out of the audio chunks. Return a generator.
         Incomplete batch is padded with a zero tensor of the feature's shape.
@@ -230,7 +210,7 @@ class AudioTranscriber:
             self._request.raw_input_contents.extend([input_bytes])
             return self._request
 
-        features = self._preprocess(audio, frame_size)
+        features = self._preprocess(audio, max_length_size)
 
         while len(features) >= self.batch_size:
             input_bytes = features[:self.batch_size].tobytes()
@@ -248,27 +228,21 @@ class AudioTranscriber:
 
         yield _request(input_bytes)
 
-    def _preprocess(self, signal, frame_size):
-        # signal = preemphasized(signal)
-        sleeve = frame_size // 4
-        signal = F.pad(signal, (sleeve, sleeve))
-        ## Just a small heuristic that helps transcribe
-        ## the beginning and the end of an audio better.
+    def _preprocess(self, signal, max_signal_length):
+        segments = list(signal.split(max_signal_length, dim=-1))
+        pad = max_signal_length - segments[-1].size(-1)
+        pad = (pad // 2, pad - pad // 2)
 
-        ## A more robust way is to segment words in the audio,
-        ## and then split or/and pad the resulting audio chunks
-        ## to form features.
-
-        segments = list(signal.split(frame_size, dim=-1))
-        pad = frame_size - segments[-1].size(-1)
-        segments[-1] = F.pad(segments[-1], (0, pad))
+        segments[-1] = F.pad(segments[-1], pad)
         segments = torch.stack(segments)
 
-        dtype = triton_to_np_dtype(self._input_dtype)
-        log_mel_spectra = normalize_spectra(self.transform(segments).log())
-        log_mel_spectra = log_mel_spectra.numpy().astype(dtype)
+        length = torch.full((len(segments),), max_signal_length)
+        segments, length = self.processor.preprocess(segments, length)
 
-        return log_mel_spectra
+        dtype = triton_to_np_dtype(self._input_dtype)
+        segments = segments.numpy().astype(dtype)
+
+        return segments
 
     def _postprocess(self, response):
         """
@@ -281,7 +255,8 @@ class AudioTranscriber:
         if not self._supports_batching:
             logits = [logits]
 
-        phrase = ' '.join(GREEDY_DECODER(logits[0]))
+        length = torch.full((len(logits),), logits[0].size(-2))
+        phrase = self.processor.postprocess(logits, length)
         return phrase
 
 
@@ -322,13 +297,13 @@ def build_argparser():
     parser.add_argument(
             'audio_file',
             nargs='?',
-            help='Input audio / Input folder.')
+            help='Input audio')
 
     return parser
 
 
-def main():
-    args = vars(build_argparser().parse_args())
+def main(args=None):
+    args = vars(build_argparser().parse_args(args))
 
     audio_file = args.pop('audio_file')
     *new_audio_file, suffix = audio_file.split('.')
@@ -347,16 +322,19 @@ def main():
             audio_file, squeeze_dims=True,
             check_audio=True, resample_to=16000)
 
-    args['transform'] = MelSpectrogram(
-            sample_rate, n_fft=512, win_length=int(sample_rate*.02),
-            n_mels=64, f_max=8000, norm='slaney', mel_scale='slaney')
+    args['processor'] = torch.load('/workspace/processor.pt')
 
-    dt = 1.27
+    # args['processor'].postprocess = GREEDY_DECODER.forward
+    # args['processor'].preprocess = MelSpectrogram(
+    #         sample_rate, n_fft=512, win_length=int(sample_rate*.02),
+    #         n_mels=64, f_max=8000, norm='slaney', mel_scale='slaney')
+
+    dt_max = 10
     transcriber = AudioTranscriber(**args)
-    transcription = transcriber(audio, int(sample_rate*dt))
+    transcription = transcriber(audio, int(sample_rate*dt_max))
     print(transcription)
 
-    return transcription
+    return transcription.strip()
 
 
 if __name__ == '__main__':

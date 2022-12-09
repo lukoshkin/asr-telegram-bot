@@ -1,0 +1,21 @@
+name: "quartznet15x5"
+platform: "onnxruntime_onnx"
+default_model_filename: "model.onnx"
+
+max_batch_size: 0
+
+input [
+    {
+        name: "processed_signal"
+        data_type: TYPE_FP32
+        dims: [1, 64, 1024]
+    }
+]
+
+output [
+    {
+        name: "logits"
+        data_type: TYPE_FP32
+        dims: [1, 512, 29]
+    }
+]
