@@ -1,22 +1,20 @@
 import logging
+from typing import Generator, Iterable
 
 import torch
 import torch.nn.functional as F
-from torchaudio.transforms import AmplitudeToDB
+from torchaudio.transforms import AmplitudeToDB, MelSpectrogram
 
 
 def preemphasized(signal: torch.Tensor, alpha=.97) -> torch.Tensor:
-    """
-    Improves signal-to-noise ratio.
+    """Improves signal-to-noise ratio.
     (Maybe redundant here since it is from older system designs.)
     """
     return torch.cat((signal[:1], signal[1:] - alpha * signal[:-1]))
 
 
 def normalized(tensor: torch.Tensor) -> torch.Tensor:
-    """
-    Mean-variance normalization of the input tensor.
-    """
+    """Mean-variance normalization of the input tensor."""
     mu = tensor.mean(-1, keepdim=True)
     sigma = tensor.std(-1, keepdim=True)
     tensor = (tensor - mu) / (sigma + 1e-5)
@@ -24,7 +22,88 @@ def normalized(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def split_on_silence(signal, frame_size=2048, hop_size=512, top_db=None):
+class AudioPreprocessor(MelSpectrogram):
+    """Local to repo audio preprocessor.
+    Obtains log scaled mel-spectrogram normalized per feature.
+    """
+    def __init__(self, sample_rate: int,
+                 log_zero_guard_value=2**-24, **kwargs):
+        self.log0_guard_val = log_zero_guard_value
+        in_frames = lambda t: int(t * sample_rate) if t < 1 else t
+
+        if 'win_length' in kwargs:
+            assert kwargs['win_length'] > 0, "'win_length' can't be negative"
+            kwargs['win_length'] = in_frames(kwargs['win_length'])
+
+        if 'hop_length' in kwargs:
+            kwargs['hop_length'] = in_frames(kwargs['hop_length'])
+
+        super().__init__(sample_rate, **kwargs)
+        ## NOTE: Setting `kwargs['normalized'] = True` is not
+        ## the same as normalizing in the forward method
+
+    def forward(self, signal: torch.Tensor) -> torch.Tensor:
+        signal = super().forward(preemphasized(signal))
+        signal = normalized((signal + self.log0_guard_val).log())
+        return signal
+
+
+class CTCDecoder(torch.nn.Module):
+    def __init__(self, labels: str | list, blank: str='-', silence: str='|'):
+        super().__init__()
+        assert isinstance(labels, Iterable) and isinstance(labels[0], str)
+        assert len(set(labels)) == len(labels), "Repeating chars in 'labels'"
+        assert isinstance(blank, str) and isinstance(silence, str)
+
+        self.labels = list(labels) + [blank, silence]
+        self.blank_id = self.labels.index(blank)
+
+    def __call__(self, raw_tokens: torch.Tensor) -> list[list[str]]:
+        tokens, lens = self.process(raw_tokens)
+
+        texts = []
+        for r, l in zip(tokens, lens):
+            text = ''.join([self.labels[i] for i in r[:l]])
+            text = text.replace('|', ' ').strip().split()
+            texts.append(text)
+
+        return texts
+
+    def process(self, mat: torch.Tensor) -> torch.Tensor:
+        assert isinstance(mat, torch.Tensor), 'Expects torch.Tensor as input'
+        assert not torch.is_floating_point(mat), 'Expects input of int dtype'
+
+        ## Locate original entries in the unique consecutive array (1D)
+        ## [[13, 7, 7, 21, 9],   ->    [[0, 1, 1, 2, 3],
+        ##  [0,  0, 9,  4, 2]]          [4, 4, 5, 6, 7]]
+        ids = torch.unique_consecutive(mat, return_inverse=True)[1]
+        ## Zero the starting index of each row
+        ids -= ids.min(dim=1, keepdims=True)[0]
+
+        ## Fill 'blank' matrix of the same size with `mat`'s data placing
+        ## consecutively repeated elements of each row under the same index.
+        ## cons_uniq[i][ids[i][j]] = mat[i][j]
+        cons_uniq = torch.full_like(mat, self.blank_id)
+        cons_uniq = cons_uniq.scatter_(1, ids, mat)
+
+        lens = (cons_uniq != self.blank_id).sum(1)
+        maxlen = lens.max()
+
+        tokens = mat.new(len(lens), maxlen)
+        tokens[:] = torch.arange(maxlen)
+        tokens -= lens[:, None]
+        mask = tokens < 0
+
+        tokens[mask] = cons_uniq[cons_uniq != self.blank_id]
+        tokens[~mask] = self.blank_id
+        return tokens, lens
+
+
+## The next two function are in a beta state of development.
+## They may serve as a more sensible splitting of a signal in chunks.
+def split_on_silence(
+        signal: torch.Tensor, frame_size: int=2048,
+        hop_size: int=512, top_db: int=None) -> torch.Tensor:
     """
     Pytorch implementation of `librosa.effects.split`
     limited to 1-channel input signals.
@@ -69,7 +148,12 @@ def split_on_silence(signal, frame_size=2048, hop_size=512, top_db=None):
     return edges
 
 
-def on_silence_generator(signal, box_size, air_bubble=.05):
+def on_silence_generator(
+        signal: torch.Tensor, box_size: int,
+        air_bubble: float=.05) -> Generator[torch.Tensor, None, None]:
+    """Splits signals in chunks of size `box_size`.
+    `air_bubble` - minimal space between signal chunks.
+    """
     assert air_bubble > 0 and 2*air_bubble < 1
     air = int(air_bubble * box_size)
 
@@ -128,30 +212,3 @@ def on_silence_generator(signal, box_size, air_bubble=.05):
             i = min(i + 1, len(stack_meta)-1)
             box_count = stack_meta[i] - stack_meta[i-1]
             yield chunk
-
-
-## Original code:
-# https://pytorch.org/audio/main/tutorials/asr_inference_with_ctc_decoder_tutorial.html
-class CTCGreedyDecoder(torch.nn.Module):
-    def __init__(self, labels, blank=-1, blank_not_in_labels=True):
-        super().__init__()
-        self.labels = list(labels)
-        self.blank = blank % (len(self.labels) + blank_not_in_labels)
-
-    def forward(self, logits):
-        """
-        Choose the most probably letter at each step.
-
-        Args:
-          logits (Tensor): Logit tensors. Shape `[num_seq, num_label]`.
-
-        Returns:
-          List[str]: The resulting transcript
-        """
-        logits = torch.Tensor(logits.copy()[0])
-        indices = torch.argmax(logits, dim=-1)  # [num_seq,]
-        indices = torch.unique_consecutive(indices, dim=-1)
-        indices = [i for i in indices if i != self.blank]
-        joined = "".join([self.labels[i] for i in indices])
-
-        return joined.replace("|", " ").strip().split()

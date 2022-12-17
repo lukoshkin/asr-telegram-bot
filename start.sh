@@ -2,21 +2,23 @@
 
 set -e
 export DOCKER_BUILDKIT=1
+choices='efficientnet-lite4 inception-graphdef quartznet15x5'
 
 help_msg () {
   echo 'Usage: ./start.sh [<options>]'
   echo
-  echo -e '  -h, --help\t\t Show this message.'
-  echo -e '  -0, --from-scratch\t Rebuild all components before the launch.'
+  printf '  %-20s %s\n' '-h, --help' 'Show this message.'
+  printf '  %-20s %s\n' '-0, --from-scratch' 'Rebuild all components before the launch.'
   echo
-  printf "  -p\t\t\t Publish client's port to the host\n"
-  printf '  -t,--tag\t\t Tag of the Triton server image.'
+  printf '  %-20s %s\n' '-p' "Publish client's port to the host"
+  printf '  %-20s %s' '-t,--tag' 'Tag of the Triton server image.'
   printf ' Default: 22.11-py3\n'
-  printf '  -n, --names\t\t Names for server and client separated by comma.'
+  printf '  %-20s %s' '-n, --names' 'Names for server and client separated by comma.'
   printf ' Default: server,client\n\n'
-  printf '  -m, --models\t\t Set classification and/or ASR NN model(s).'
-  printf ' Default: inception_graphdef,quartznet15x5\n'
-  printf '  -c, --topk-guesses\t Number of guessed classes'
+  printf '  %-20s %s' '-m, --models' 'Set classification and/or ASR NN model(s).'
+  printf ' Default: inception-graphdef,quartznet15x5\n'
+  printf '  %-20s Default choices: %s\n' '' "$choices"
+  printf '  %-20s %s' '-c, --topk-guesses' 'Number of guessed classes'
   printf ' (classification task). Default: 1\n'
 }
 
@@ -40,6 +42,8 @@ launch_and_check () {
 
   local run_cmd="docker run --rm -d --name $name --net=backend"
   local logfile=/tmp/asr-telegram-bot.log
+  ## Clear previous sessions logs, keep only relevant.
+  > $logfile
 
   printf "Starting %s.." "$name"
   if ! container_is_running "$name"; then
@@ -73,7 +77,7 @@ init_variables () {
 
   while [[ $1 != -- ]]; do
     case $1 in
-      -h|--help)            help_msg; return ;;
+      -h|--help)            help_msg; exit ;;
       -0|--from-scratch)    from_scratch=true; shift 1 ;;
 
       -p)                   port=$2; shift 2 ;;
@@ -83,12 +87,12 @@ init_variables () {
       -c|--topk-guesses)    topk=$2; shift 2 ;;
       -m|--models)          models=$2; shift 2 ;;
 
-      *) echo Impl.error3: Infinite args parsing; return 1 ;;
+      *) echo Impl.error3: Infinite args parsing; exit 1 ;;
     esac
   done
 
   workdir="$(realpath "$(dirname "${BASH_SOURCE[0]}")")"
-  server_img=triton-server:tg-bot
+  server_img=nvcr.io/nvidia/tritonserver:${tag:-22.11-py3}
   client_img=triton-client:tg-bot
 
   server=$(cut -d, -f1 <<< "$names")
@@ -96,8 +100,10 @@ init_variables () {
   server=${server:-server}
   client=${client:-client}
 
+  [[ $models =~ , ]] || models+=,
+  ## if there is no delimiter, the fields will be the same.
   visual_model=$(cut -d, -f1 <<< "$models")
-  audio_model=$(cut -d, -f2 <<< "$models")
+  acoustic_model=$(cut -d, -f2 <<< "$models")
 }
 
 
@@ -105,44 +111,48 @@ main () {
   init_variables "$@"
 
   if ${from_scratch:=false}; then
-    docker stop "$server" 2> /dev/null || :  # discard return value; thus,
-    docker stop "$client" 2> /dev/null || :  # the cmd is ignored by `set -e`
+    docker stop "$server" &> /dev/null || :  # discard return value; this way,
+    docker stop "$client" &> /dev/null || :  # the cmd is ignored by `set -e`
   fi
 
   if $from_scratch || [[ -z $(docker images -q "$server_img") ]]; then
-    docker build \
-      --build-arg "IMAGE_TAG=${tag:-22.11-py3}" \
-      -t "$server_img" server/
+    docker pull "$server_img"
   fi
 
   if $from_scratch || [[ -z $(docker images -q "$client_img") ]]; then
-    docker build \
-      --cache-from "$client_img" \
-      --cache-from "$server_img" \
-      -t "$client_img" client/
+    docker build -t "$client_img" "$workdir/client/"
   fi
 
   # Ignore the exit code of network creation if the network already exists.
   docker network create backend 2> /dev/null || :
 
-  launch_and_check "$server" \ "$server_img \
-    tritonserver --model-repository=/models" \
-    'Started GRPCInferenceService at'
-
   launch_and_check "$client" \
-    "-e ASR_MODEL=${audio_model:-quartznet15x5} \
-     -e CLASSIFIER_MODEL=${visual_model:-inception_graphdef} \
+    "-e ASR_MODEL=${acoustic_model:-quartznet15x5} \
+     -e CLASSIFIER_MODEL=${visual_model:-inception-graphdef} \
      -e CLASSIFIER_TOPK=${topk:-1} \
      -p${port:-8000}:80 -v$workdir:/workspace $client_img" \
      'Application startup complete'
 
-  docker cp "$server":/models/quartznet15x5/1/processor.pt \
-    "$client":/workspace/
-
-  if [[ -d server/models ]]; then
-    echo Copying custom models..
-    docker cp models/custom/* "$server":/models
+  if  [[ -d $workdir/server/models ]]; then
+    folders=$(ls "$workdir/server/models")
+    skip=true
   fi
+
+  for model in $choices; do
+    [[ $folders =~ $model ]] || skip=false
+  done
+
+  if ! $skip; then
+    printf 'Copying default models..'
+    mkdir -p "$workdir/server"
+    docker cp "$client":/models "$workdir/server"
+    printf '\033[1K\r'
+  fi
+
+  launch_and_check "$server" \
+    "-v$workdir/server/models:/models $server_img \
+    tritonserver --model-repository=/models" \
+    'Started GRPCInferenceService at'
 }
 
 

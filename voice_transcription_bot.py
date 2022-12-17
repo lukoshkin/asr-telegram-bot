@@ -1,6 +1,7 @@
+#!/usr/bin/env python3
 """
 This is VoiceTranscriptionBot (in fact, TranscribeVoiceBot ─
-since all the other options were occupied). It transcribes any
+since all the other names were occupied). It transcribes any
 incoming voice messages. But only those in English are good :)
 """
 import logging
@@ -20,14 +21,14 @@ parser.add_argument(
 parser.add_argument(
         '-t',
         '--api-token',
-        required=True,
         help="Your telegram bot's token")
 
 args = parser.parse_args()
 HOST = f'http://127.0.0.1:{args.port}'
+api_token = args.api_token if args.api_token else input("HTTP API's TOKEN: ")
 
 logging.basicConfig(level=logging.INFO)
-bot = Bot(token=args.api_token)
+bot = Bot(token=api_token)
 dp = Dispatcher(bot)
 
 
@@ -67,7 +68,7 @@ async def transcibe(message: types.Message):
     req = requests.get(f'{HOST}/voice')
     transcription = req.json()['message']
 
-    reply = 'Check if the following is on the record?:'
+    reply = 'Check if the following is on the record?:\n'
     reply += transcription
 
     await bot.send_message(message.from_user.id, f'{reply}')

@@ -10,7 +10,7 @@ app = FastAPI()
 @app.get("/image")
 def classify_image():
     cnum = int(os.environ.get('CLASSIFIER_TOPK', '1'))
-    model = os.environ.get('CLASSIFIER_MODEL', 'inception_graphdef')
+    model = os.environ.get('CLASSIFIER_MODEL', 'inception-graphdef')
     arg_str = f'-m {model} -c {cnum} -s INCEPTION input_image.jpeg'
     msg = grpc_image_client.main(arg_str.split())
     return {"message": msg}
